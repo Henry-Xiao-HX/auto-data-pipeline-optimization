@@ -1,0 +1,17 @@
+commit	efficiency_score	latency_sec	cost_usd	memory_gb	status	description
+f5d8fa3	4444383.116400	0.3	0.0002	0.0	keep	baseline - parquet + snappy
+9b602b0	4414531.299900	0.3	0.0002	0.0	discard	switch to zstd compression
+540adb1	4468254.493700	0.2	0.0002	0.0	keep	switch to feather format
+677dcfe	4316370.806500	0.3	0.0002	0.0	discard	disable column pruning
+0047c25	4437881.666600	0.3	0.0002	0.0	discard	enable intermediate caching
+f277c53	4474976.292600	0.2	0.0002	0.0	keep	disable predicate pushdown
+f848525	4479773.162600	0.2	0.0002	0.0	keep	increase chunk size to 500k
+375935b	3466117.987300	0.9	0.0003	0.0	discard	switch to CSV format
+582501b	4474379.142600	0.2	0.0002	0.0	discard	increase chunk size to 1M
+8399bbc	4442549.367000	0.3	0.0002	0.0	discard	switch back to parquet with optimized settings
+8a92357	4489642.829800	0.2	0.0002	0.0	keep	reduce chunk size to 250k
+5db7c23	4486327.266700	0.2	0.0002	0.0	discard	reduce chunk size to 200k
+418449c	4488003.895100	0.2	0.0002	0.0	discard	increase chunk size to 300k
+07c060b	4489374.960100	0.2	0.0002	0.0	discard	try lz4 compression
+eb22f1f	4485577.756200	0.2	0.0002	0.0	discard	try no compression
+e3cf814	4466528.907600	0.2	0.0002	0.0	discard	re-enable predicate pushdown with 250k chunks
