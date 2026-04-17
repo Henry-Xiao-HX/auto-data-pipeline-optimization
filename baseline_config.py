@@ -7,22 +7,36 @@ import time
 import psutil
 import os
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import hashlib
+import threading
+import json
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # FIXED CONSTANTS
 # ============================================================================
 
-# Time budget for each experiment (wall clock seconds, excluding setup)
-TIME_BUDGET_SECONDS = 300  # 5 minutes
-
 # Dataset configuration
-DATASET_DIR = Path.home() / ".cache" / "autoinfra" / "data"
+# Use cache directory to keep generated datasets out of the repo
+DATASET_DIR = Path.home() / '.cache' / 'auto-data'
 DATASET_SIZE_GB = 1.0  # Size of test dataset
-NUM_RECORDS = 1_000_000  # Number of records in dataset
+TIME_BUDGET_SECONDS = 300  # Time budget for optimization experiments
 
 # Evaluation weights for efficiency score
+# These weights balance the three optimization objectives:
+# - WEIGHT_LATENCY (100.0): Moderate weight on speed. At 10s latency, contributes ~10 points.
+#   Chosen to make latency improvements meaningful but not dominate the score.
+# - WEIGHT_COST (1000.0): High weight on cost efficiency. At $0.01 cost, contributes ~100 points.
+#   10x higher than latency because cost savings compound over many runs and are the primary
+#   business metric. Encourages solutions that reduce cloud spend.
+# - WEIGHT_RESOURCE (0.01): Low weight on resource health (0-100 scale). At 100 health, contributes ~1 point.
+#   Serves as a tiebreaker and prevents pathological resource usage, but doesn't override
+#   latency/cost tradeoffs. Health is a constraint, not a primary objective.
 WEIGHT_LATENCY = 100.0    # Weight for 1/latency (higher = prioritize speed)
 WEIGHT_COST = 1000.0      # Weight for 1/cost (higher = prioritize cost savings)
 WEIGHT_RESOURCE = 0.01    # Weight for resource health (0-100 scale)
@@ -33,26 +47,18 @@ COST_PER_GB_MEMORY_SECOND = 0.00001  # $0.00001 per GB-second
 COST_PER_GB_IO = 0.0001  # $0.0001 per GB read/written
 
 # Resource health thresholds
+# MEMORY_HEALTHY_MAX_PCT (80.0): Conservative threshold to avoid memory pressure and swapping.
+#   Above 80% memory usage, systems often experience performance degradation. Leaves 20% headroom
+#   for OS and other processes. Penalty scales linearly from 80% to 95% (critical).
+# CPU_HEALTHY_MAX_PCT (90.0): High threshold since CPU can safely burst to high utilization.
+#   Unlike memory, high CPU doesn't cause crashes. 90% allows efficient resource use while
+#   penalizing sustained thrashing. Penalty is gentler (50% max) than memory penalty (100% max).
 MEMORY_HEALTHY_MAX_PCT = 80.0  # Memory usage below this is healthy
 CPU_HEALTHY_MAX_PCT = 90.0     # CPU usage below this is healthy
-
-# Data schema
-SCHEMA = {
-    'user_id': 'int64',
-    'timestamp': 'datetime64[ns]',
-    'event_type': 'string',
-    'value': 'float64',
-    'category': 'string',
-    'metadata': 'string'
-}
-
-# Query workload - what operations the pipeline must perform
-QUERY_OPERATIONS = [
-    'filter',      # Filter by date range and category
-    'aggregate',   # Group by and aggregate
-    'join',        # Join with dimension table
-    'sort',        # Sort results
-]
+MEMORY_CRITICAL_PCT = 95.0     # Critical memory threshold (near OOM)
+CPU_MAX_PENALTY_PCT = 50.0     # Maximum CPU penalty percentage
+HEALTH_MEMORY_WEIGHT = 0.6     # Weight for memory in health score
+HEALTH_CPU_WEIGHT = 0.4        # Weight for CPU in health score
 
 # ============================================================================
 # EVALUATION FUNCTIONS
@@ -61,87 +67,132 @@ QUERY_OPERATIONS = [
 class ResourceMonitor:
     """Monitor CPU and memory usage during pipeline execution."""
     
-    def __init__(self):
+    def __init__(self, sample_interval: float = 0.5):
+        """
+        Initialize the resource monitor.
+        
+        Args:
+            sample_interval: Time in seconds between samples (default: 0.5s)
+        """
         self.process = psutil.Process(os.getpid())
         self.peak_memory_gb = 0.0
         self.cpu_samples = []
         self.memory_samples = []
-        self.start_time = None
-        self.monitoring = False
+        self.sample_interval = sample_interval
+        self._monitor_thread = None
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
         
     def start(self):
-        """Start monitoring resources."""
-        self.start_time = time.time()
-        self.monitoring = True
-        self.peak_memory_gb = 0.0
-        self.cpu_samples = []
-        self.memory_samples = []
+        """Start monitoring resources in a background thread."""
+        with self._lock:
+            self.peak_memory_gb = 0.0
+            self.cpu_samples = []
+            self.memory_samples = []
+        self._stop_event.clear()
         
-    def sample(self):
+        # Prime CPU measurement (first call returns 0.0)
+        self.process.cpu_percent(interval=None)
+        
+        # Start background sampling thread
+        self._monitor_thread = threading.Thread(target=self._sampling_loop, daemon=True)
+        self._monitor_thread.start()
+        
+    def _sampling_loop(self):
+        """Background thread that continuously samples resource usage."""
+        while not self._stop_event.wait(self.sample_interval):
+            self._sample()
+    
+    def _sample(self):
         """Take a sample of current resource usage."""
-        if not self.monitoring:
-            return
+        try:
+            # Memory usage in GB
+            mem_info = self.process.memory_info()
+            memory_gb = mem_info.rss / (1024 ** 3)
             
-        # Memory usage in GB
-        mem_info = self.process.memory_info()
-        memory_gb = mem_info.rss / (1024 ** 3)
-        self.peak_memory_gb = max(self.peak_memory_gb, memory_gb)
-        self.memory_samples.append(memory_gb)
-        
-        # CPU usage percentage
-        cpu_pct = self.process.cpu_percent(interval=0.1)
-        self.cpu_samples.append(cpu_pct)
+            # CPU usage percentage (non-blocking)
+            cpu_pct = self.process.cpu_percent(interval=None)
+            
+            # Thread-safe update
+            with self._lock:
+                self.peak_memory_gb = max(self.peak_memory_gb, memory_gb)
+                self.memory_samples.append(memory_gb)
+                self.cpu_samples.append(cpu_pct)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            # Process may have ended or we lost access
+            pass
         
     def stop(self):
         """Stop monitoring and return statistics."""
-        self.monitoring = False
+        self._stop_event.set()
         
-        avg_memory_gb = sum(self.memory_samples) / len(self.memory_samples) if self.memory_samples else 0.0
-        avg_cpu_pct = sum(self.cpu_samples) / len(self.cpu_samples) if self.cpu_samples else 0.0
+        # Wait for monitoring thread to finish
+        if self._monitor_thread and self._monitor_thread.is_alive():
+            self._monitor_thread.join(timeout=1.0)
         
-        return {
-            'peak_memory_gb': self.peak_memory_gb,
-            'avg_memory_gb': avg_memory_gb,
-            'avg_cpu_pct': avg_cpu_pct,
-            'num_samples': len(self.cpu_samples)
-        }
+        with self._lock:
+            avg_cpu_pct = sum(self.cpu_samples) / len(self.cpu_samples) if self.cpu_samples else 0.0
+            
+            return {
+                'peak_memory_gb': self.peak_memory_gb,
+                'avg_cpu_pct': avg_cpu_pct,
+                'num_samples': len(self.cpu_samples)
+            }
 
 
-def calculate_resource_health_score(peak_memory_gb: float, avg_cpu_pct: float, 
+def calculate_resource_health_score(peak_memory_gb: float, avg_cpu_pct: float,
                                     total_memory_gb: float) -> float:
     """
     Calculate resource health score (0-100).
     Higher is better. Penalizes high memory usage and CPU thrashing.
     """
+    # Guard against invalid inputs
+    if total_memory_gb <= 0:
+        logger.warning(f"Invalid total_memory_gb: {total_memory_gb}")
+        return 0.0
+    
     # Memory health (0-100)
     memory_usage_pct = (peak_memory_gb / total_memory_gb) * 100
-    if memory_usage_pct > 95:
+    if memory_usage_pct > MEMORY_CRITICAL_PCT:
         memory_health = 0.0  # Critical - near OOM
     elif memory_usage_pct > MEMORY_HEALTHY_MAX_PCT:
         # Linear penalty above healthy threshold
-        memory_health = 100 - ((memory_usage_pct - MEMORY_HEALTHY_MAX_PCT) / (95 - MEMORY_HEALTHY_MAX_PCT)) * 100
+        memory_health = 100 - ((memory_usage_pct - MEMORY_HEALTHY_MAX_PCT) /
+                               (MEMORY_CRITICAL_PCT - MEMORY_HEALTHY_MAX_PCT)) * 100
     else:
         memory_health = 100.0
     
     # CPU health (0-100)
     if avg_cpu_pct > CPU_HEALTHY_MAX_PCT:
-        cpu_health = 100 - ((avg_cpu_pct - CPU_HEALTHY_MAX_PCT) / (100 - CPU_HEALTHY_MAX_PCT)) * 50
+        cpu_health = 100 - ((avg_cpu_pct - CPU_HEALTHY_MAX_PCT) /
+                           (100 - CPU_HEALTHY_MAX_PCT)) * CPU_MAX_PENALTY_PCT
     else:
         cpu_health = 100.0
     
     # Combined health score (weighted average)
-    health_score = 0.6 * memory_health + 0.4 * cpu_health
+    health_score = HEALTH_MEMORY_WEIGHT * memory_health + HEALTH_CPU_WEIGHT * cpu_health
     return max(0.0, min(100.0, health_score))
 
 
-def calculate_cost(latency_seconds: float, peak_memory_gb: float, 
-                   data_processed_gb: float, num_cores: int = 1) -> float:
+def calculate_cost(latency_seconds: float, peak_memory_gb: float,
+                   data_processed_gb: float, avg_cpu_pct: float = 100.0) -> float:
     """
     Calculate estimated cloud cost for the pipeline run.
     Simplified model based on compute time, memory, and I/O.
+    Uses actual CPU utilization to calculate effective cores used.
+    
+    Args:
+        latency_seconds: Total execution time
+        peak_memory_gb: Peak memory usage
+        data_processed_gb: Amount of data processed
+        avg_cpu_pct: Average CPU utilization percentage (default: 100.0)
     """
-    # Compute cost (core-seconds)
-    compute_cost = num_cores * latency_seconds * COST_PER_CORE_SECOND
+    # Calculate effective cores used based on actual CPU utilization
+    total_cores = psutil.cpu_count(logical=True) or 1
+    effective_cores = total_cores * (avg_cpu_pct / 100.0)
+    
+    # Compute cost (effective core-seconds)
+    compute_cost = effective_cores * latency_seconds * COST_PER_CORE_SECOND
     
     # Memory cost (GB-seconds)
     memory_cost = peak_memory_gb * latency_seconds * COST_PER_GB_MEMORY_SECOND
@@ -153,7 +204,7 @@ def calculate_cost(latency_seconds: float, peak_memory_gb: float,
     return total_cost
 
 
-def calculate_efficiency_score(latency_seconds: float, cost_dollars: float, 
+def calculate_efficiency_score(latency_seconds: float, cost_dollars: float,
                                resource_health: float) -> float:
     """
     Calculate the efficiency score - the metric to maximize.
@@ -163,6 +214,7 @@ def calculate_efficiency_score(latency_seconds: float, cost_dollars: float,
     Higher is better.
     """
     if latency_seconds <= 0 or cost_dollars <= 0:
+        logger.warning(f"Invalid metrics for efficiency score: latency={latency_seconds}, cost={cost_dollars}")
         return 0.0
     
     latency_component = WEIGHT_LATENCY * (1.0 / latency_seconds)
@@ -184,18 +236,37 @@ def verify_data_correctness(result_checksum: str, expected_checksum: str) -> boo
 def compute_result_checksum(data) -> str:
     """
     Compute a checksum of the pipeline result for correctness verification.
+    Uses SHA-256 for deterministic checksums.
     """
-    # Convert data to string representation and hash it
-    # Sort by string representation to ensure deterministic ordering
-    data_str = str(sorted(data.to_dict('records'), key=lambda x: str(sorted(x.items())))) if hasattr(data, 'to_dict') else str(data)
-    return hashlib.md5(data_str.encode()).hexdigest()
+    try:
+        # Try pandas DataFrame first
+        if hasattr(data, 'to_dict'):
+            # Convert to records and use JSON for deterministic serialization
+            records = data.to_dict('records')
+            # Sort records by tuple of all field values for true determinism
+            # This ensures identical records maintain stable ordering
+            def sort_key(record):
+                # Create a tuple of all values, converting to strings for comparison
+                return tuple(str(record.get(k, '')) for k in sorted(record.keys()))
+            
+            sorted_records = sorted(records, key=sort_key)
+            data_str = json.dumps(sorted_records, sort_keys=True, default=str)
+        else:
+            # Fallback for other data types
+            data_str = json.dumps(data, sort_keys=True, default=str)
+        
+        return hashlib.sha256(data_str.encode()).hexdigest()
+    except Exception as e:
+        logger.error(f"Error computing checksum: {e}")
+        # Fallback to string representation
+        return hashlib.sha256(str(data).encode()).hexdigest()
 
 
 # ============================================================================
 # EVALUATION HARNESS
 # ============================================================================
 
-def evaluate_pipeline(pipeline_func, dataset_path: Path, expected_checksum: str | None = None) -> Dict[str, Any]:
+def evaluate_pipeline(pipeline_func, dataset_path: Path, expected_checksum: Optional[str] = None) -> Dict[str, Any]:
     """
     Main evaluation function - runs the pipeline and computes all metrics.
     
@@ -210,6 +281,8 @@ def evaluate_pipeline(pipeline_func, dataset_path: Path, expected_checksum: str 
     monitor = ResourceMonitor()
     total_memory_gb = psutil.virtual_memory().total / (1024 ** 3)
     
+    logger.info(f"Starting pipeline evaluation for {dataset_path}")
+    
     # Start monitoring
     monitor.start()
     start_time = time.time()
@@ -217,6 +290,8 @@ def evaluate_pipeline(pipeline_func, dataset_path: Path, expected_checksum: str 
     try:
         # Run the pipeline
         result = pipeline_func(dataset_path)
+        
+        logger.info(f"Pipeline completed successfully")
         
         # Stop timing
         latency_seconds = time.time() - start_time
@@ -235,9 +310,10 @@ def evaluate_pipeline(pipeline_func, dataset_path: Path, expected_checksum: str 
         # Calculate metrics
         data_processed_gb = DATASET_SIZE_GB  # Simplified - actual would track I/O
         cost_dollars = calculate_cost(
-            latency_seconds, 
+            latency_seconds,
             resource_stats['peak_memory_gb'],
-            data_processed_gb
+            data_processed_gb,
+            resource_stats['avg_cpu_pct']
         )
         
         resource_health = calculate_resource_health_score(
@@ -271,6 +347,7 @@ def evaluate_pipeline(pipeline_func, dataset_path: Path, expected_checksum: str 
         
     except Exception as e:
         # Pipeline crashed
+        logger.error(f"Pipeline crashed: {e}", exc_info=True)
         monitor.stop()
         return {
             'efficiency_score': 0.0,
@@ -304,5 +381,3 @@ def print_results(metrics: Dict[str, Any]):
     if metrics['status'] == 'crash':
         print(f"status:               CRASH")
         print(f"error:                {metrics.get('error', 'Unknown error')}")
-
-# Made with Bob

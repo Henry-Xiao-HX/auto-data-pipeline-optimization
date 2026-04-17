@@ -11,7 +11,13 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import pyarrow as pa
 import pyarrow.parquet as pq
-from baseline_config import DATASET_DIR, NUM_RECORDS, DATASET_SIZE_GB, SCHEMA
+from baseline_config import DATASET_DIR, DATASET_SIZE_GB
+
+# Dataset generation configuration
+# Calculate number of records to achieve target dataset size
+# Approximate: 6 columns * 8 bytes average per field = ~48 bytes per record
+# For 1 GB dataset: 1,000,000,000 bytes / 48 bytes ≈ 20,000,000 records
+NUM_RECORDS = int((DATASET_SIZE_GB * 1_000_000_000) / 48)
 
 def generate_synthetic_data(num_records: int = NUM_RECORDS) -> pd.DataFrame:
     """
