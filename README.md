@@ -1,14 +1,14 @@
-# AutoInfra - Autonomous Infrastructure Optimization
+# AutoInfra - Autonomous Data Pipeline Optimization
 
-An autonomous AI agent that optimizes data pipeline infrastructure by experimenting with different configurations to find the optimal balance between speed, cost, and resource efficiency.
+An autonomous AI agent that optimizes data pipelines by experimenting with different configurations to find the optimal balance between speed, cost, and resource efficiency.
 
 ## Overview
 
-This is an adaptation of Andrej Karpathy's "Auto-Research" methodology applied to data infrastructure optimization. Instead of training model weights to minimize validation loss, the agent autonomously "trains" your data architecture to maximize an efficiency score.
+This is an adaptation of Andrej Karpathy's "Auto-Research" methodology applied to data pipeline optimization. Instead of training model weights to minimize validation loss, the agent autonomously "trains" your pipeline configuration to maximize an efficiency score.
 
 **The Core Loop:**
 1. **Initialize**: Start with baseline pipeline configuration
-2. **Mutate**: AI agent modifies infrastructure levers (partitioning, compression, query optimization, etc.)
+2. **Mutate**: AI agent modifies pipeline levers (partitioning, compression, query optimization, etc.)
 3. **Benchmark**: Run modified pipeline for fixed 5-minute duration
 4. **Evaluate**: Measure efficiency score = f(latency, cost, resource_health)
 5. **Iterate**: Keep improvements, discard regressions, repeat indefinitely
@@ -29,7 +29,7 @@ uv sync
 
 ```bash
 # Generate 1M record synthetic dataset (~100MB)
-python generate_dataset.py
+uv run python generate_dataset.py
 ```
 
 This creates:
@@ -42,13 +42,13 @@ This creates:
 
 ```bash
 # Run the baseline pipeline to verify setup
-python pipeline.py
+uv run python pipeline.py
 ```
 
 Expected output:
 ```
 ================================================================================
-INFRASTRUCTURE OPTIMIZATION EXPERIMENT
+DATA PIPELINE OPTIMIZATION EXPERIMENT
 ================================================================================
 
 Configuration:
@@ -86,7 +86,7 @@ EXPERIMENT COMPLETED SUCCESSFULLY
 
 ### 4. Start Autonomous Optimization
 
-Point your AI agent (Claude, GPT-4, etc.) to `infrastructure_program.md` and let it run:
+Point your AI agent (Claude, GPT-4, etc.) to `infrastructure_program.md` and let it run on the data pipeline optimization workflow:
 
 ```
 Hi, have a look at infrastructure_program.md and let's kick off a new experiment! Let's do the setup first.
@@ -107,15 +107,15 @@ baseline_config.py           # Fixed evaluation harness (DO NOT MODIFY)
 pipeline.py                  # Pipeline configuration (AGENT MODIFIES THIS)
 generate_dataset.py          # Dataset generation script
 infrastructure_program.md    # Agent instructions
-infra_results.tsv           # Experiment results log
-pyproject.toml              # Dependencies
+infra_results.tsv            # Experiment results log
+pyproject.toml               # Dependencies and uv-managed environment
 ```
 
 ## Key Files
 
 ### `baseline_config.py` (Read-Only)
 
-Contains the fixed evaluation harness:
+Contains the fixed evaluation harness for data pipeline experiments:
 - Time budget (5 minutes)
 - Dataset configuration
 - Efficiency score calculation
@@ -166,7 +166,7 @@ Default weights:
 - `w2 = 1000.0` (cost weight)
 - `w3 = 0.01` (resource health weight)
 
-## Infrastructure Levers
+## Pipeline Levers
 
 The agent can modify:
 
@@ -225,7 +225,7 @@ NUM_RECORDS = 100_000_000  # 100M records
 
 2. Regenerate dataset:
 ```bash
-python generate_dataset.py
+uv run python generate_dataset.py
 ```
 
 3. Adjust time budget if needed (default 5 minutes)
@@ -241,17 +241,17 @@ Adjust in `baseline_config.py` to match your cloud provider.
 
 ## Tips for Success
 
-1. **Start Simple**: Let the agent explore basic optimizations first (compression, column pruning)
+1. **Start Simple**: Let the agent explore basic pipeline optimizations first (compression, column pruning)
 2. **Monitor Progress**: Check `infra_results.tsv` periodically to see what's working
 3. **Iterate on Instructions**: Edit `infrastructure_program.md` to guide the agent toward promising areas
 4. **Use Git**: Each experiment is a commit, easy to review and revert
-5. **Let it Run**: The agent works best when left alone overnight
+5. **Use uv consistently**: Run scripts with `uv run` so experiments use the managed project environment
 
 ## Troubleshooting
 
 ### Dataset not found
 ```bash
-python generate_dataset.py
+uv run python generate_dataset.py
 ```
 
 ### Dependencies missing
